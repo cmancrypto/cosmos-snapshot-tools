@@ -3,7 +3,7 @@
 Cosmos Staking Query Tool
 
 This script queries Cosmos chains for delegator data and calculates total 
-staked amounts for airdrop allocation purposes.
+staked amounts for each delegator.
 """
 
 import argparse
@@ -32,19 +32,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default chain allocations (example)
-DEFAULT_CHAIN_ALLOCATIONS = {
-    "cosmos": 1000000,
-    "osmosis": 2000000,
-    "juno": 500000,
-}
+# Default chains to query if none specified
+DEFAULT_CHAINS = ["cosmos", "osmosis", "juno"]
 
 class ChainConfig:
     """Stores configuration data for a Cosmos chain."""
     
-    def __init__(self, name: str, tokens_allocated: int):
+    def __init__(self, name: str):
         self.name = name
-        self.tokens_allocated = tokens_allocated
         self.pretty_name = ""
         self.chain_id = ""
         self.bech32_prefix = ""
@@ -66,18 +61,18 @@ class CosmosStakingQueryTool:
     - Aggregating delegations by address
     """
     
-    def __init__(self, chain_allocations: Dict[str, int], output_file: str, max_retries: int = 5, 
+    def __init__(self, chains: List[str], output_file: str, max_retries: int = 5, 
                  concurrency_limit: int = 3, validator_retries: int = 10, enable_recovery: bool = True):
         self.chain_configs = {
-            name: ChainConfig(name, tokens) 
-            for name, tokens in chain_allocations.items()
+            name: ChainConfig(name) 
+            for name in chains
         }
         self.output_file = output_file
         self.max_retries = max_retries
         self.validator_retries = validator_retries
         self.concurrency_limit = concurrency_limit
         self.enable_recovery = enable_recovery
-        self.delegator_data = pd.DataFrame(columns=["chain", "address", "staked_amount"])
+        self.all_stakers_data = {}  # Dictionary to store all staker data
         self.failed_validators = {}  # To track validators that fail even after retries
     
     async def run(self):
@@ -105,7 +100,7 @@ class CosmosStakingQueryTool:
             
         # Post-process and save results
         self.finalize_results()
-        return self.delegator_data
+        return self.all_stakers_data
     
     async def fetch_all_chain_configs(self, session: aiohttp.ClientSession):
         """Fetch configuration for all chains."""
@@ -163,9 +158,16 @@ class CosmosStakingQueryTool:
             logger.error(f"Error fetching config for {chain_config.name}: {str(e)}")
             raise
     
-    async def process_chain(self, session: aiohttp.ClientSession, chain_config: ChainConfig) -> pd.DataFrame:
+    async def process_chain(self, session: aiohttp.ClientSession, chain_config: ChainConfig) -> Dict:
         """Process a single chain to get all delegator data."""
         logger.info(f"Processing chain: {chain_config.name}")
+        chain_data = {
+            "chain_id": chain_config.chain_id,
+            "name": chain_config.name,
+            "pretty_name": chain_config.pretty_name,
+            "bech32_prefix": chain_config.bech32_prefix,
+            "stakers": {}
+        }
         
         try:
             # Get all validators
@@ -214,25 +216,39 @@ class CosmosStakingQueryTool:
             elif failed_validators:
                 logger.warning(f"Recovery mode disabled - skipping recovery attempts for {len(failed_validators)} validators")
             
-            # Create a DataFrame for this chain
+            # Create stakers data for this chain
             if delegator_data_list:
-                chain_df = pd.DataFrame(delegator_data_list)
+                # Convert to DataFrame for easier aggregation
+                df = pd.DataFrame(delegator_data_list)
                 
                 # Aggregate delegations by address
-                chain_df = chain_df.groupby("address").agg({
+                stakers_df = df.groupby("address").agg({
                     "staked_amount": "sum",
-                    "chain": "first"
+                    "denom": "first"
                 }).reset_index()
                 
-                logger.info(f"Processed {len(chain_df)} unique delegators for {chain_config.name}")
-                return chain_df
+                # Convert to dictionary format for JSON output
+                stakers = {}
+                for _, row in stakers_df.iterrows():
+                    stakers[row["address"]] = {
+                        "amount": int(row["staked_amount"]),
+                        "denom": row["denom"]
+                    }
+                
+                chain_data["stakers"] = stakers
+                chain_data["total_stakers"] = len(stakers)
+                chain_data["total_staked"] = int(stakers_df["staked_amount"].sum())
+                chain_data["denom"] = stakers_df["denom"].iloc[0] if not stakers_df.empty else ""
+                
+                logger.info(f"Processed {len(stakers)} unique delegators for {chain_config.name}")
             else:
                 logger.warning(f"No delegator data found for {chain_config.name}")
-                return pd.DataFrame(columns=["chain", "address", "staked_amount"])
+            
+            return chain_data
                 
         except Exception as e:
             logger.error(f"Error processing chain {chain_config.name}: {str(e)}")
-            return pd.DataFrame(columns=["chain", "address", "staked_amount"])
+            return chain_data
             
     async def recover_failed_validators(self, session: aiohttp.ClientSession, 
                                       chain_config: ChainConfig, 
@@ -421,27 +437,37 @@ class CosmosStakingQueryTool:
         return delegations
     
     def finalize_results(self):
-        """Combine all chain data and save to CSV."""
+        """Process the results and save to JSON file."""
         logger.info("Finalizing and saving results")
         
         try:
-            # Save the full dataset
-            if not self.delegator_data.empty:
-                self.delegator_data.to_csv(self.output_file, index=False)
-                logger.info(f"Saved delegator data to {self.output_file}")
-                
-                # Print summary
-                chain_summary = self.delegator_data.groupby("chain").agg({
-                    "address": "count",
-                    "staked_amount": "sum"
-                })
-                chain_summary.columns = ["unique_delegators", "total_staked"]
-                
-                logger.info("\nChain Staking Summary:")
-                logger.info(chain_summary)
-            else:
-                logger.warning("No delegator data to save")
-                
+            # Prepare final output data
+            output_data = {
+                "metadata": {
+                    "generated_at": datetime.now().isoformat(),
+                    "chains_processed": len(self.all_stakers_data),
+                    "total_validators_failed": sum(len(validators) for validators in self.failed_validators.values()) if self.failed_validators else 0
+                },
+                "chains": self.all_stakers_data
+            }
+            
+            # Save to JSON file
+            with open(self.output_file, 'w') as f:
+                json.dump(output_data, f, indent=2)
+            
+            logger.info(f"Saved staker data to {self.output_file}")
+            
+            # Print summary
+            total_stakers = 0
+            for chain_name, chain_data in self.all_stakers_data.items():
+                stakers_count = chain_data.get("total_stakers", 0)
+                total_staked = chain_data.get("total_staked", 0)
+                denom = chain_data.get("denom", "")
+                logger.info(f"Chain {chain_name}: {stakers_count} stakers, {total_staked} {denom} total staked")
+                total_stakers += stakers_count
+            
+            logger.info(f"Total unique stakers across {len(self.all_stakers_data)} chains: {total_stakers}")
+            
             # Save report of failed validators
             if self.failed_validators:
                 failed_report_path = f"failed_validators_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -462,9 +488,8 @@ async def main():
     parser = argparse.ArgumentParser(description="Query staking data from Cosmos chains")
     
     parser.add_argument("--chains", type=str, help="Comma-separated list of chain names to query")
-    parser.add_argument("--config", type=str, help="Path to JSON config file with chain:allocation pairs")
-    parser.add_argument("--output", type=str, default="delegator_data.csv", 
-                        help="Output CSV file path (default: delegator_data.csv)")
+    parser.add_argument("--output", type=str, default="stakers_data.json", 
+                        help="Output JSON file path (default: stakers_data.json)")
     parser.add_argument("--concurrency", type=int, default=3, 
                         help="Maximum number of chains to process concurrently (default: 3)")
     parser.add_argument("--retries", type=int, default=5, 
@@ -476,31 +501,19 @@ async def main():
     
     args = parser.parse_args()
     
-    # Determine chain allocations
-    chain_allocations = {}
-    
-    if args.config:
-        # Load from config file
-        try:
-            with open(args.config, 'r') as f:
-                chain_allocations = json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading config file: {str(e)}")
-            sys.exit(1)
-    elif args.chains:
-        # Use chains from command line with default allocations of 1000000 each
+    # Determine chains to query
+    chains = []
+    if args.chains:
         chains = [chain.strip() for chain in args.chains.split(",")]
-        chain_allocations = {chain: 1000000 for chain in chains}
     else:
-        # Use default allocations
-        chain_allocations = DEFAULT_CHAIN_ALLOCATIONS
-        logger.info("Using default chain allocations")
+        chains = DEFAULT_CHAINS
+        logger.info(f"No chains specified, using defaults: {', '.join(chains)}")
     
-    logger.info(f"Processing chains: {', '.join(chain_allocations.keys())}")
+    logger.info(f"Processing chains: {', '.join(chains)}")
     
     # Create and run the tool
     tool = CosmosStakingQueryTool(
-        chain_allocations=chain_allocations,
+        chains=chains,
         output_file=args.output,
         max_retries=args.retries,
         concurrency_limit=args.concurrency,
@@ -508,12 +521,7 @@ async def main():
         enable_recovery=not args.no_recovery
     )
     
-    delegator_data = await tool.run()
-    
-    # Print final summary
-    if not delegator_data.empty:
-        total_delegators = len(delegator_data)
-        logger.info(f"\nTotal unique delegators across all chains: {total_delegators}")
+    stakers_data = await tool.run()
     
 
 if __name__ == "__main__":

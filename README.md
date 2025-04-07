@@ -1,14 +1,17 @@
 # Cosmos Snapshot Tools
 
+A collection of tools for gathering and processing data from Cosmos blockchains.
+
 ## Staking Query Tool
 
-This tool queries the staking module for various Cosmos chains to gather delegator data for airdrop allocation calculations. It:
+This tool queries the staking module for various Cosmos chains to gather delegator data. It:
 
 1. Fetches chain configuration from chains.cosmos.directory
 2. Queries validators from rest.cosmos.directory
 3. Collects delegator data for each validator
 4. Aggregates delegations by address
 5. Processes multiple chains in parallel
+6. Outputs comprehensive staker data in JSON format
 
 ### Features
 
@@ -19,7 +22,7 @@ This tool queries the staking module for various Cosmos chains to gather delegat
 - **Advanced Recovery Mode**: Makes additional attempts with longer delays for any validators that fail even after retries
 - **Parallel Processing**: Processes multiple chains and validators concurrently
 - **Comprehensive Logging**: Detailed logging with file and console output
-- **Flexible Configuration**: Define chains via command line, config file, or defaults
+- **JSON Output**: Outputs all staker data in a structured JSON format
 
 ### Installation
 
@@ -36,7 +39,7 @@ pip install -r requirements.txt
 
 #### Basic Usage
 
-Run with default chains:
+Run with default chains (cosmos, osmosis, juno):
 
 ```bash
 python staking_query.py
@@ -48,18 +51,18 @@ Run with specific chains:
 python staking_query.py --chains cosmos,osmosis,juno
 ```
 
-#### Advanced Usage
-
-Use a configuration file for chain allocations:
+Specify a custom output file (JSON):
 
 ```bash
-python staking_query.py --config example_config.json
+python staking_query.py --output my_stakers.json
 ```
 
-Specify output file and concurrency level:
+#### Advanced Usage
+
+Process chains with increased concurrency:
 
 ```bash
-python staking_query.py --chains cosmos,osmosis --output cosmos_delegators.csv --concurrency 5
+python staking_query.py --chains cosmos,osmosis --concurrency 5
 ```
 
 Increase validator retries for more reliable data collection:
@@ -74,24 +77,11 @@ Disable recovery mode (not recommended for complete data collection):
 python staking_query.py --no-recovery
 ```
 
-### Configuration File Format
-
-Create a JSON file with chain names and token allocations:
-
-```json
-{
-    "cosmos": 1000000,
-    "osmosis": 2000000,
-    "juno": 500000
-}
-```
-
 ### Command Line Options
 
 ```
 --chains              Comma-separated list of chain names to query
---config              Path to JSON config file with chain:allocation pairs
---output              Output CSV file path (default: delegator_data.csv)
+--output              Output JSON file path (default: stakers_data.json)
 --concurrency         Maximum number of chains to process concurrently (default: 3)
 --retries             Maximum number of retries for API calls (default: 5)
 --validator-retries   Maximum number of retries for validator delegator queries (default: 10)
@@ -100,28 +90,68 @@ Create a JSON file with chain names and token allocations:
 
 ### Output Format
 
-The tool produces a CSV file with the following columns:
+The tool produces a JSON file with the following structure:
 
-- `chain`: The name of the chain (e.g., "cosmos", "osmosis")
-- `address`: The delegator's address
-- `staked_amount`: The total amount staked by the delegator (in the chain's base units)
+```json
+{
+  "metadata": {
+    "generated_at": "2023-04-05T12:34:56",
+    "chains_processed": 3,
+    "total_validators_failed": 2
+  },
+  "chains": {
+    "cosmos": {
+      "chain_id": "cosmoshub-4",
+      "name": "cosmos",
+      "pretty_name": "Cosmos Hub",
+      "bech32_prefix": "cosmos",
+      "stakers": {
+        "cosmos1abc...": {
+          "amount": 1000000,
+          "denom": "uatom"
+        },
+        "cosmos1xyz...": {
+          "amount": 5000000,
+          "denom": "uatom"
+        }
+      },
+      "total_stakers": 1000,
+      "total_staked": 500000000000,
+      "denom": "uatom"
+    },
+    "osmosis": {
+      // Similar structure for other chains
+    }
+  }
+}
+```
 
-If any validators fail even after all retry attempts, a JSON file with details about the failed validators will be created.
+## Staker Filter Tool
+
+This tool takes the JSON output from the Staking Query Tool and filters it based on various criteria, such as minimum staking thresholds.
+
+### Usage
+
+Filter stakers based on minimum staking thresholds:
+
+```bash
+python filter_stakers.py --input stakers_data.json --output filtered_stakers.json --min-threshold "cosmos:1000000,osmosis:5000000"
+```
+
+### Command Line Options
+
+```
+--input               Input JSON file with staker data (from staking_query.py)
+--output              Output JSON file for filtered data (default: filtered_stakers.json)
+--min-threshold       Minimum staking amount thresholds by chain, format: 'chain:amount,chain:amount'
+```
 
 ### Examples
 
+Include only stakers with at least 100 ATOM and 500 OSMO:
+
 ```bash
-# Query just the Cosmos Hub
-python staking_query.py --chains cosmos
-
-# Query multiple chains with custom output file
-python staking_query.py --chains cosmos,osmosis,juno --output delegations.csv
-
-# Use configuration file and increase concurrency
-python staking_query.py --config chains.json --concurrency 5
-
-# Maximum reliability mode with increased retries
-python staking_query.py --retries 10 --validator-retries 20
+python filter_stakers.py --input stakers_data.json --min-threshold "cosmos:100000000,osmosis:500000000"
 ```
 
 ### Performance Considerations
