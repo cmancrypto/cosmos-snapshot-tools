@@ -1,0 +1,12 @@
+{
+  "chains": [
+    "cosmoshub",
+    "osmosis",
+    "archway"
+  ],
+  "concurrency": 1,
+  "retries": 7,
+  "validator_retries": 15,
+  "enable_recovery": true,
+  "output_file": "stakers_data.json"
+} 

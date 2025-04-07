@@ -1,0 +1,12 @@
+{
+  "input_file": "stakers_data.json",
+  "output_file": "filtered_stakers.json",
+  "thresholds": {
+    "cosmos": 1000000,
+    "osmosis": 500000,
+    "juno": 100000,
+    "akash": 50000,
+    "evmos": 10000000,
+    "stargaze": 20000
+  }
+} 

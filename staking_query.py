@@ -20,6 +20,7 @@ import aiohttp
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -74,6 +75,10 @@ class CosmosStakingQueryTool:
         self.enable_recovery = enable_recovery
         self.all_stakers_data = {}  # Dictionary to store all staker data
         self.failed_validators = {}  # To track validators that fail even after retries
+        
+        # Track pagination errors to adjust pagination size adaptively
+        self.pagination_error_count = {}  # Chain name -> error count
+        self.chain_pagination_sizes = {}  # Chain name -> current pagination size
     
     async def run(self):
         """Main execution function to process all chains."""
@@ -177,7 +182,9 @@ class CosmosStakingQueryTool:
             # Process validators in batches to not overwhelm the endpoints
             delegator_data_list = []
             failed_validators = []
-            batch_size = 5  # Process 5 validators at a time
+            
+            # Smaller batch size to reduce rate limiting
+            batch_size = 2  # Reduced from 5 to 2 validators at a time
             
             with tqdm(total=len(validators), desc=f"Processing {chain_config.name} validators") as pbar:
                 for i in range(0, len(validators), batch_size):
@@ -202,6 +209,10 @@ class CosmosStakingQueryTool:
                         delegator_data_list.extend(delegator_list)
                     
                     pbar.update(len(validator_batch))
+                    
+                    # Add delay between batches to avoid rate limiting
+                    logger.info(f"Completed batch. Waiting before next batch...")
+                    await asyncio.sleep(random.uniform(5.0, 10.0))
             
             # Record any failed validators
             if failed_validators:
@@ -255,78 +266,138 @@ class CosmosStakingQueryTool:
                                       validators: List[str]) -> List[Dict]:
         """
         Last-ditch effort to recover data from validators that failed even after multiple retries.
-        Uses much longer delays between attempts.
+        Uses much longer delays between attempts and a more conservative approach.
         """
         all_recovered_delegations = []
         
-        for validator in tqdm(validators, desc=f"Recovery attempts for {chain_config.name}"):
-            recovered = False
-            # Try with much longer delays
-            for attempt in range(1, 4):  # 3 additional attempts with longer delays
-                try:
-                    logger.info(f"Recovery attempt {attempt}/3 for validator {validator}")
-                    # Extended delay before retry
-                    await asyncio.sleep(10 * attempt)  # 10, 20, 30 seconds delay
-                    
-                    # Custom implementation without using the retry decorator
-                    delegations = []
-                    next_key = None
-                    
-                    while True:
-                        endpoint = f"{chain_config.rest_endpoint}/cosmos/staking/v1beta1/validators/{validator}/delegations"
-                        params = {"pagination.limit": "100"}
-                        
-                        if next_key:
-                            params["pagination.key"] = next_key
-                        
-                        async with session.get(endpoint, params=params, timeout=30) as response:
-                            if response.status != 200:
-                                error_text = await response.text()
-                                logger.warning(f"Recovery attempt {attempt} failed with HTTP {response.status}: {error_text}")
-                                break
-                            
-                            data = await response.json()
-                            
-                            # Extract delegator info
-                            for delegation in data.get("delegation_responses", []):
-                                delegator_addr = delegation.get("delegation", {}).get("delegator_address")
-                                balance = delegation.get("balance", {})
-                                
-                                if delegator_addr and balance:
-                                    amount = int(balance.get("amount", 0))
-                                    denom = balance.get("denom", "")
-                                    
-                                    if amount > 0:
-                                        delegations.append({
-                                            "chain": chain_config.name,
-                                            "address": delegator_addr,
-                                            "staked_amount": amount,
-                                            "denom": denom
-                                        })
-                            
-                            # Check for pagination
-                            pagination = data.get("pagination", {})
-                            next_key = pagination.get("next_key")
-                            
-                            if not next_key:
-                                break
-                            
-                            # Extra delay for pagination in recovery mode
-                            await asyncio.sleep(random.uniform(2, 5))
-                    
-                    if delegations:
-                        all_recovered_delegations.extend(delegations)
-                        logger.info(f"Successfully recovered {len(delegations)} delegations for validator {validator}")
-                        recovered = True
-                        break
-                
-                except Exception as e:
-                    logger.warning(f"Recovery attempt {attempt} failed for validator {validator}: {str(e)}")
-            
-            if not recovered:
-                logger.error(f"All recovery attempts failed for validator {validator}")
+        # Group validators by whether they likely failed due to rate limiting
+        rate_limited_validators = []
+        other_error_validators = []
         
+        for validator in validators:
+            # Check if this validator was rate limited based on the error log
+            if any(f"validator {validator}" in entry and "429" in entry for entry in self.get_recent_error_logs()):
+                rate_limited_validators.append(validator)
+            else:
+                other_error_validators.append(validator)
+                
+        if rate_limited_validators:
+            logger.info(f"Attempting recovery for {len(rate_limited_validators)} rate-limited validators with extra caution")
+            
+        # Process non-rate-limited validators first
+        for validator in tqdm(other_error_validators, desc=f"Recovery attempts for {chain_config.name} (regular errors)"):
+            recovered_delegations = await self.attempt_validator_recovery(session, chain_config, validator, 
+                                                    max_attempts=3, base_delay=10)
+            if recovered_delegations:
+                all_recovered_delegations.extend(recovered_delegations)
+                
+        # Then process rate-limited validators with much more caution
+        for validator in tqdm(rate_limited_validators, desc=f"Recovery attempts for {chain_config.name} (rate-limited)"):
+            # Much longer delays between attempts for rate-limited validators
+            recovered_delegations = await self.attempt_validator_recovery(session, chain_config, validator, 
+                                                    max_attempts=3, base_delay=60, 
+                                                    pagination_delay_range=(5, 15))
+            if recovered_delegations:
+                all_recovered_delegations.extend(recovered_delegations)
+                
         return all_recovered_delegations
+        
+    def get_recent_error_logs(self) -> List[str]:
+        """Gets recent error logs from the logger to identify rate-limited validators."""
+        # This is a simple implementation; in a production environment,
+        # you might want to use a more sophisticated approach to access logs
+        try:
+            with open(next(Path(".").glob("staking_query_*.log")), 'r') as f:
+                return [line for line in f.readlines() if "ERROR" in line and ("429" in line or "rate" in line.lower())]
+        except (StopIteration, FileNotFoundError, PermissionError):
+            return []  # Return empty list if no log file found or can't read it
+    
+    async def attempt_validator_recovery(self, session: aiohttp.ClientSession, 
+                                       chain_config: ChainConfig, validator: str,
+                                       max_attempts: int = 3, base_delay: int = 10,
+                                       pagination_delay_range: tuple = (2, 5)) -> List[Dict]:
+        """Helper method to attempt recovery for a single validator with customizable parameters."""
+        recovered = False
+        delegations = []
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"Recovery attempt {attempt}/{max_attempts} for validator {validator}")
+                # Extended delay before retry - increases with each attempt
+                delay = base_delay * attempt
+                logger.info(f"Waiting {delay}s before attempting...")
+                await asyncio.sleep(delay)
+                
+                # Custom implementation without using the retry decorator
+                next_key = None
+                
+                while True:
+                    endpoint = f"{chain_config.rest_endpoint}/cosmos/staking/v1beta1/validators/{validator}/delegations"
+                    # Use adaptive pagination size based on chain's error rate
+                    pagination_size = self.get_pagination_size_for_chain(chain_config.name, "recovery")
+                    params = {"pagination.limit": str(pagination_size)}
+                    
+                    if next_key:
+                        params["pagination.key"] = next_key
+                    
+                    async with session.get(endpoint, params=params, timeout=60) as response:
+                        if response.status == 429:
+                            # If rate limited during recovery, use an even longer delay
+                            error_text = await response.text()
+                            retry_after = response.headers.get('Retry-After')
+                            wait_time = int(retry_after) if retry_after and retry_after.isdigit() else random.randint(60, 120)
+                            
+                            logger.warning(f"Rate limited during recovery for {validator}. Waiting {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                            break  # Break out of pagination and retry the whole validator
+                            
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.warning(f"Recovery attempt {attempt} failed with HTTP {response.status}: {error_text}")
+                            break
+                        
+                        data = await response.json()
+                        
+                        # Extract delegator info
+                        for delegation in data.get("delegation_responses", []):
+                            delegator_addr = delegation.get("delegation", {}).get("delegator_address")
+                            balance = delegation.get("balance", {})
+                            
+                            if delegator_addr and balance:
+                                amount = int(balance.get("amount", 0))
+                                denom = balance.get("denom", "")
+                                
+                                if amount > 0:
+                                    delegations.append({
+                                        "chain": chain_config.name,
+                                        "address": delegator_addr,
+                                        "staked_amount": amount,
+                                        "denom": denom
+                                    })
+                        
+                        # Check for pagination
+                        pagination = data.get("pagination", {})
+                        next_key = pagination.get("next_key")
+                        
+                        if not next_key:
+                            recovered = True
+                            break
+                        
+                        # Extra delay for pagination in recovery mode - use the custom range
+                        min_delay, max_delay = pagination_delay_range
+                        await asyncio.sleep(random.uniform(min_delay, max_delay))
+                
+                if recovered:
+                    logger.info(f"Successfully recovered {len(delegations)} delegations for validator {validator}")
+                    break
+            
+            except Exception as e:
+                logger.warning(f"Recovery attempt {attempt} failed for validator {validator}: {str(e)}")
+        
+        if not recovered:
+            logger.error(f"All recovery attempts failed for validator {validator}")
+            
+        return delegations
     
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=60))
     async def get_all_validators(self, session: aiohttp.ClientSession, chain_config: ChainConfig) -> List[str]:
@@ -339,7 +410,7 @@ class CosmosStakingQueryTool:
         
         while True:
             endpoint = f"{chain_config.rest_endpoint}/cosmos/staking/v1beta1/validators"
-            params = {"pagination.limit": "100"}
+            params = {"pagination.limit": "150"}
             
             if next_key:
                 params["pagination.key"] = next_key
@@ -375,25 +446,52 @@ class CosmosStakingQueryTool:
         
         return validators
     
-    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=2, max=120))
+    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=5, max=300))
     async def get_validator_delegations(self, session: aiohttp.ClientSession, 
                                        chain_config: ChainConfig, validator_addr: str) -> List[Dict]:
         """
         Get all delegations for a validator, handling pagination.
         Returns a list of delegator data dicts.
+        
+        Uses aggressive exponential backoff to handle rate limiting.
         """
         delegations = []
         next_key = None
         
+        # Add a random initial delay to stagger requests
+        await asyncio.sleep(random.uniform(1.0, 3.0))
+        
         while True:
             endpoint = f"{chain_config.rest_endpoint}/cosmos/staking/v1beta1/validators/{validator_addr}/delegations"
-            params = {"pagination.limit": "100"}
+            # Use adaptive pagination size based on chain's error rate
+            pagination_size = self.get_pagination_size_for_chain(chain_config.name, "delegations")
+            params = {"pagination.limit": str(pagination_size)}
             
             if next_key:
                 params["pagination.key"] = next_key
             
             try:
-                async with session.get(endpoint, params=params) as response:
+                async with session.get(endpoint, params=params, timeout=60) as response:
+                    # Special handling for rate limiting
+                    if response.status == 429:
+                        error_text = await response.text()
+                        retry_after = response.headers.get('Retry-After')
+                        wait_time = int(retry_after) if retry_after and retry_after.isdigit() else random.randint(30, 60)
+                        
+                        logger.warning(f"Rate limited (429) for validator {validator_addr} on {chain_config.name}. Waiting {wait_time}s before retry.")
+                        # Record the error to potentially reduce pagination size
+                        self.record_pagination_error(chain_config.name)
+                        await asyncio.sleep(wait_time)
+                        raise Exception(f"Rate limited: {error_text}")
+                    
+                    # Check for other potential pagination-related errors
+                    if response.status in [500, 502, 503, 504]:
+                        error_text = await response.text()
+                        logger.warning(f"Server error for validator {validator_addr} on {chain_config.name}: HTTP {response.status}")
+                        # Record error to potentially reduce pagination size on server errors
+                        self.record_pagination_error(chain_config.name)
+                        raise Exception(f"HTTP {response.status} from API: {error_text}")
+                    
                     if response.status != 200:
                         # Don't immediately skip validators with error responses
                         # The @retry decorator will handle retrying this function
@@ -427,14 +525,76 @@ class CosmosStakingQueryTool:
                     if not next_key:
                         break
                     
-                    # To avoid rate limiting
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    # More aggressive delay for pagination to avoid rate limiting
+                    await asyncio.sleep(random.uniform(3.0, 8.0))
             
             except Exception as e:
+                # If we hit a rate limit, re-raise to trigger exponential backoff
+                if "Rate limited" in str(e) or "429" in str(e):
+                    logger.warning(f"Rate limit encountered for {validator_addr}, triggering backoff...")
+                    raise
+                
                 logger.error(f"Error fetching delegations for validator {validator_addr} on {chain_config.name}: {str(e)}")
                 raise
         
         return delegations
+    
+    def get_pagination_size_for_chain(self, chain_name: str, request_type: str = "delegations") -> int:
+        """
+        Get the appropriate pagination size for a chain based on its error history.
+        Adaptively reduces pagination size if too many errors are encountered.
+        
+        Args:
+            chain_name: The name of the chain
+            request_type: Type of request ("delegations" or "recovery")
+            
+        Returns:
+            The pagination size to use
+        """
+        # If we haven't set a pagination size for this chain yet, initialize it
+        if chain_name not in self.chain_pagination_sizes:
+            # Start with maximum size for normal delegations
+            if request_type == "delegations":
+                self.chain_pagination_sizes[chain_name] = 500
+            # Use a smaller initial size for recovery requests
+            elif request_type == "recovery":
+                self.chain_pagination_sizes[chain_name] = 200
+            else:
+                # Default fallback
+                self.chain_pagination_sizes[chain_name] = 150
+        
+        # Get the current error count for this chain
+        error_count = self.pagination_error_count.get(chain_name, 0)
+        
+        # Adjust pagination size based on error count
+        current_size = self.chain_pagination_sizes[chain_name]
+        
+        # If we have errors, progressively reduce the pagination size
+        if error_count > 0:
+            if error_count == 1:
+                # After first error, reduce to 250
+                new_size = min(current_size, 250)
+            elif error_count == 2:
+                # After second error, reduce to 150
+                new_size = min(current_size, 150)
+            elif error_count >= 3:
+                # After third error and beyond, use conservative 100
+                new_size = 100
+            
+            # Only log if we're actually reducing the size
+            if new_size < current_size:
+                logger.info(f"Reducing pagination size for {chain_name} from {current_size} to {new_size} due to {error_count} errors")
+                self.chain_pagination_sizes[chain_name] = new_size
+                
+        return self.chain_pagination_sizes[chain_name]
+    
+    def record_pagination_error(self, chain_name: str):
+        """Record that a chain had a pagination-related error."""
+        if chain_name not in self.pagination_error_count:
+            self.pagination_error_count[chain_name] = 0
+        
+        self.pagination_error_count[chain_name] += 1
+        logger.warning(f"Recorded pagination error for {chain_name} (total: {self.pagination_error_count[chain_name]})")
     
     def finalize_results(self):
         """Process the results and save to JSON file."""
@@ -498,14 +658,54 @@ async def main():
                         help="Maximum number of retries for validator delegator queries (default: 10)")
     parser.add_argument("--no-recovery", action="store_true",
                         help="Disable recovery attempts for failed validators")
+    parser.add_argument("--config", type=str, help="Path to JSON config file")
     
     args = parser.parse_args()
     
-    # Determine chains to query
+    # Initialize default values
     chains = []
+    output_file = args.output
+    concurrency_limit = args.concurrency
+    max_retries = args.retries
+    validator_retries = args.validator_retries
+    enable_recovery = not args.no_recovery
+    
+    # If config file provided, load settings from it
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                config = json.load(f)
+                
+            # Load values from config, with command line args taking precedence
+            if "chains" in config and isinstance(config["chains"], list):
+                chains = config["chains"]
+            
+            if "output_file" in config and not args.output:
+                output_file = config["output_file"]
+                
+            if "concurrency" in config and not args.concurrency:
+                concurrency_limit = config["concurrency"]
+                
+            if "retries" in config and not args.retries:
+                max_retries = config["retries"]
+                
+            if "validator_retries" in config and not args.validator_retries:
+                validator_retries = config["validator_retries"]
+                
+            if "enable_recovery" in config and not args.no_recovery:
+                enable_recovery = config["enable_recovery"]
+                
+            logger.info(f"Loaded configuration from {args.config}")
+        except Exception as e:
+            logger.error(f"Error loading config file: {str(e)}")
+            sys.exit(1)
+    
+    # Command line chains arg takes precedence over config file
     if args.chains:
         chains = [chain.strip() for chain in args.chains.split(",")]
-    else:
+    
+    # If no chains specified anywhere, use defaults
+    if not chains:
         chains = DEFAULT_CHAINS
         logger.info(f"No chains specified, using defaults: {', '.join(chains)}")
     
@@ -514,11 +714,11 @@ async def main():
     # Create and run the tool
     tool = CosmosStakingQueryTool(
         chains=chains,
-        output_file=args.output,
-        max_retries=args.retries,
-        concurrency_limit=args.concurrency,
-        validator_retries=args.validator_retries,
-        enable_recovery=not args.no_recovery
+        output_file=output_file,
+        max_retries=max_retries,
+        concurrency_limit=concurrency_limit,
+        validator_retries=validator_retries,
+        enable_recovery=enable_recovery
     )
     
     stakers_data = await tool.run()

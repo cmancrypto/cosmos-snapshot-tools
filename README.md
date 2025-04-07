@@ -23,6 +23,7 @@ This tool queries the staking module for various Cosmos chains to gather delegat
 - **Parallel Processing**: Processes multiple chains and validators concurrently
 - **Comprehensive Logging**: Detailed logging with file and console output
 - **JSON Output**: Outputs all staker data in a structured JSON format
+- **Configuration Files**: Support for JSON configuration files to simplify running with complex settings
 
 ### Installation
 
@@ -77,6 +78,12 @@ Disable recovery mode (not recommended for complete data collection):
 python staking_query.py --no-recovery
 ```
 
+Use a configuration file:
+
+```bash
+python staking_query.py --config example_chains.json
+```
+
 ### Command Line Options
 
 ```
@@ -86,7 +93,32 @@ python staking_query.py --no-recovery
 --retries             Maximum number of retries for API calls (default: 5)
 --validator-retries   Maximum number of retries for validator delegator queries (default: 10)
 --no-recovery         Disable recovery attempts for failed validators
+--config              Path to JSON configuration file
 ```
+
+### Configuration File Format
+
+The tool accepts a JSON configuration file with the following structure:
+
+```json
+{
+  "chains": [
+    "cosmos",
+    "osmosis",
+    "juno",
+    "akash",
+    "evmos",
+    "stargaze"
+  ],
+  "concurrency": 3,
+  "retries": 5,
+  "validator_retries": 10,
+  "enable_recovery": true,
+  "output_file": "stakers_data.json"
+}
+```
+
+Command line arguments take precedence over configuration file settings.
 
 ### Output Format
 
@@ -138,13 +170,41 @@ Filter stakers based on minimum staking thresholds:
 python filter_stakers.py --input stakers_data.json --output filtered_stakers.json --min-threshold "cosmos:1000000,osmosis:5000000"
 ```
 
+Use a configuration file:
+
+```bash
+python filter_stakers.py --config example_filter.json
+```
+
 ### Command Line Options
 
 ```
 --input               Input JSON file with staker data (from staking_query.py)
 --output              Output JSON file for filtered data (default: filtered_stakers.json)
 --min-threshold       Minimum staking amount thresholds by chain, format: 'chain:amount,chain:amount'
+--config              Path to JSON configuration file
 ```
+
+### Configuration File Format
+
+The filter tool accepts a JSON configuration file with the following structure:
+
+```json
+{
+  "input_file": "stakers_data.json",
+  "output_file": "filtered_stakers.json",
+  "thresholds": {
+    "cosmos": 1000000,
+    "osmosis": 500000,
+    "juno": 100000,
+    "akash": 50000,
+    "evmos": 10000000,
+    "stargaze": 20000
+  }
+}
+```
+
+Command line arguments take precedence over configuration file settings.
 
 ### Examples
 
@@ -152,6 +212,13 @@ Include only stakers with at least 100 ATOM and 500 OSMO:
 
 ```bash
 python filter_stakers.py --input stakers_data.json --min-threshold "cosmos:100000000,osmosis:500000000"
+```
+
+Run a complete pipeline with configuration files:
+
+```bash
+python staking_query.py --config example_chains.json
+python filter_stakers.py --config example_filter.json
 ```
 
 ### Performance Considerations
@@ -167,4 +234,28 @@ python filter_stakers.py --input stakers_data.json --min-threshold "cosmos:10000
 - Check the log file (staking_query_YYYYMMDD_HHMMSS.log) for detailed error information
 - For chains with a large number of validators/delegators, the process may take a long time to complete
 - If you see many failed validators even with high retry values, the RPC endpoint may be unstable - consider trying again later
+
+#### Handling Rate Limiting (HTTP 429 Errors)
+
+If you see HTTP 429 "Too Many Requests" errors in the logs, the API endpoints are rate-limiting your requests. Here are some strategies to work around this:
+
+1. **Reduce concurrency**: Set `"concurrency": 1` in your configuration file to process chains one at a time:
+   ```json
+   {
+     "concurrency": 1
+   }
+   ```
+
+2. **Process one chain at a time**: Run the tool for each chain separately rather than all at once:
+   ```bash
+   python staking_query.py --chains cosmoshub --output cosmoshub_stakers.json
+   ```
+
+3. **Run during off-peak hours**: API endpoints often have less traffic during nights and weekends.
+
+4. **Use a different RPC endpoint**: Some chains provide multiple RPC endpoints which may have different rate limits.
+
+5. **Break up your queries**: For very large chains like Cosmos Hub, you might need to query validators in smaller batches.
+
+The tool uses exponential backoff and recovery mechanisms to handle rate limiting, but extremely strict rate limits may still prevent complete data collection.
 

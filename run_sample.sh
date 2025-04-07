@@ -23,11 +23,19 @@ python staking_query.py --chains cosmos --validator-retries 15 --retries 8 --out
 echo "Running without recovery mode (faster but less complete)..."
 python staking_query.py --chains cosmos --no-recovery --output stakers_no_recovery.json
 
+# Example using a configuration file
+echo "Running with configuration file..."
+python staking_query.py --config example_chains.json
+
 # Filter examples
 echo "Filtering stakers based on minimum thresholds..."
 python filter_stakers.py --input stakers_default.json --output filtered_min_threshold.json --min-threshold "cosmos:1000000,osmosis:500000"
 
-# Example running the full pipeline
-echo "Running full pipeline (query + filter)..."
-python staking_query.py --chains cosmos,osmosis --output pipeline_stakers.json
-python filter_stakers.py --input pipeline_stakers.json --output pipeline_filtered.json --min-threshold "cosmos:1000000,osmosis:500000" 
+# Example running the filter with a configuration file
+echo "Running filter with configuration file..."
+python filter_stakers.py --config example_filter.json
+
+# Example running the full pipeline with configuration files
+echo "Running full pipeline with configuration files..."
+python staking_query.py --config example_chains.json
+python filter_stakers.py --config example_filter.json 

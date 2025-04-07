@@ -192,17 +192,56 @@ def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(description="Filter staker data based on various criteria")
     
-    parser.add_argument("--input", type=str, required=True,
+    parser.add_argument("--input", type=str,
                         help="Input JSON file with staker data (from staking_query.py)")
     parser.add_argument("--output", type=str, default="filtered_stakers.json",
                         help="Output JSON file for filtered data (default: filtered_stakers.json)")
     parser.add_argument("--min-threshold", type=str,
                         help="Minimum staking amount thresholds by chain, format: 'chain:amount,chain:amount'")
+    parser.add_argument("--config", type=str, 
+                        help="Path to JSON config file with filter settings")
     
     args = parser.parse_args()
     
+    # Initialize default values
+    input_file = args.input
+    output_file = args.output
+    thresholds = {}
+    
+    # If config file provided, load settings from it
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                config = json.load(f)
+                
+            # Load values from config with command line args taking precedence
+            if "input_file" in config and not args.input:
+                input_file = config["input_file"]
+                
+            if "output_file" in config and not args.output:
+                output_file = config["output_file"]
+                
+            if "thresholds" in config and isinstance(config["thresholds"], dict):
+                thresholds = config["thresholds"]
+                
+            logger.info(f"Loaded configuration from {args.config}")
+        except Exception as e:
+            logger.error(f"Error loading config file: {str(e)}")
+            sys.exit(1)
+    
+    # Command line args take precedence over config file
+    if args.min_threshold:
+        cmd_thresholds = parse_threshold(args.min_threshold)
+        # Update thresholds with command line values
+        thresholds.update(cmd_thresholds)
+    
+    # Ensure required parameters are present
+    if not input_file:
+        logger.error("Input file must be specified either in config or via --input")
+        sys.exit(1)
+    
     # Create filter
-    filter_tool = StakerFilter(args.input, args.output)
+    filter_tool = StakerFilter(input_file, output_file)
     
     # Load data
     if not filter_tool.load_data():
@@ -210,10 +249,8 @@ def main():
         sys.exit(1)
     
     # Set thresholds
-    if args.min_threshold:
-        thresholds = parse_threshold(args.min_threshold)
-        for chain, amount in thresholds.items():
-            filter_tool.set_threshold(chain, amount)
+    for chain, amount in thresholds.items():
+        filter_tool.set_threshold(chain, amount)
     
     # Apply filters
     if not filter_tool.apply_filters():
