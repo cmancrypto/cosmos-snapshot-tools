@@ -1,6 +1,55 @@
 # Cosmos Snapshot Tools
 
-A collection of tools for gathering and processing data from Cosmos blockchains.
+Tools for querying and analyzing validator and delegator data across Cosmos ecosystem chains.
+
+## Overview
+
+This repository contains a collection of tools for:
+- Querying validator information from multiple Cosmos ecosystem chains
+- Retrieving delegator data for specified validators
+- Filtering stakers based on various criteria
+- Processing and analyzing delegation data
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/username/cosmos-snapshot-tools.git
+cd cosmos-snapshot-tools
+```
+
+2. Install the required dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## Usage Examples
+
+The `run_chains_directory.sh` script demonstrates various usage patterns:
+
+```bash
+./run_chains_directory.sh
+```
+
+This script shows:
+- How to query a single chain
+- How to query multiple chains with increased concurrency
+- How to query with enhanced reliability settings
+- How to filter stakers based on minimum thresholds
+
+## Key Scripts
+
+- `staking_query.py`: Query validator and delegator information
+- `filter_stakers.py`: Filter staking data based on various criteria
+- `test_cosmos_directory.py`: Test the Cosmos Directory implementation
+
+## License
+
+[Specify the license]
+
+## Contributing
+
+[Contribution guidelines]
 
 ## Staking Query Tool
 
@@ -24,17 +73,6 @@ This tool queries the staking module for various Cosmos chains to gather delegat
 - **Comprehensive Logging**: Detailed logging with file and console output
 - **JSON Output**: Outputs all staker data in a structured JSON format
 - **Configuration Files**: Support for JSON configuration files to simplify running with complex settings
-
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/cosmos-snapshot-tools.git
-cd cosmos-snapshot-tools
-
-# Install dependencies
-pip install -r requirements.txt
-```
 
 ### Usage
 

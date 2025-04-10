@@ -14,7 +14,10 @@ from datetime import datetime
 import time
 import random
 import sys
+import re
+import urllib.parse
 from typing import Dict, List, Set, Tuple, Any, Optional
+from collections import defaultdict
 
 import aiohttp
 import pandas as pd
@@ -36,6 +39,22 @@ logger = logging.getLogger(__name__)
 # Default chains to query if none specified
 DEFAULT_CHAINS = ["cosmos", "osmosis", "juno"]
 
+class RestEndpoint:
+    """Class to track a REST endpoint and its error count."""
+    
+    def __init__(self, address: str, provider: str = ""):
+        self.address = address
+        self.provider = provider
+        self.error_count = 0
+        
+    def increment_error(self):
+        """Increment the error count for this endpoint."""
+        self.error_count += 1
+        
+    def __str__(self) -> str:
+        return f"{self.address} (Provider: {self.provider}, Errors: {self.error_count})"
+
+
 class ChainConfig:
     """Stores configuration data for a Cosmos chain."""
     
@@ -44,11 +63,68 @@ class ChainConfig:
         self.pretty_name = ""
         self.chain_id = ""
         self.bech32_prefix = ""
-        self.rest_endpoint = ""
+        self.rest_endpoints = []  # List of RestEndpoint objects
         self.is_configured = False
     
+    def add_rest_endpoint(self, address: str, provider: str = ""):
+        """Add a REST endpoint to this chain's configuration."""
+        self.rest_endpoints.append(RestEndpoint(address, provider))
+    
+    def get_rest_endpoint(self, offset: int = 0) -> Optional[str]:
+        """
+        Get the REST endpoint with the lowest error count, plus an offset.
+        
+        Args:
+            offset: Skip this many endpoints (sorted by error count)
+            
+        Returns:
+            The endpoint address or None if no endpoints available
+        """
+        if not self.rest_endpoints:
+            return None
+            
+        # Sort endpoints by error count
+        sorted_endpoints = sorted(self.rest_endpoints, key=lambda e: e.error_count)
+        
+        # Get the endpoint at the specified offset (or the last one if offset too large)
+        endpoint_index = min(offset, len(sorted_endpoints) - 1)
+        endpoint = sorted_endpoints[endpoint_index]
+        
+        logger.debug(f"Using endpoint {endpoint} for {self.name} (offset {offset})")
+        return endpoint.address
+    
+    def record_endpoint_error(self, endpoint_address: str):
+        """Record an error for the specified endpoint."""
+        for endpoint in self.rest_endpoints:
+            if endpoint.address == endpoint_address:
+                endpoint.increment_error()
+                logger.warning(f"Recorded error for endpoint {endpoint_address} (now has {endpoint.error_count} errors)")
+                break
+    
+    def get_endpoints_report(self) -> List[Dict]:
+        """
+        Generate a detailed report of all REST endpoints with their error counts.
+        
+        Returns:
+            List of dictionaries with endpoint data
+        """
+        # Sort endpoints by error count (lowest first)
+        sorted_endpoints = sorted(self.rest_endpoints, key=lambda e: e.error_count)
+        
+        return [
+            {
+                "address": endpoint.address,
+                "provider": endpoint.provider,
+                "error_count": endpoint.error_count
+            }
+            for endpoint in sorted_endpoints
+        ]
+    
     def __str__(self) -> str:
-        return f"Chain: {self.pretty_name} ({self.name}), ID: {self.chain_id}, Prefix: {self.bech32_prefix}"
+        endpoints_str = ", ".join([e.address for e in self.rest_endpoints[:3]])
+        if len(self.rest_endpoints) > 3:
+            endpoints_str += f" and {len(self.rest_endpoints) - 3} more"
+        return f"Chain: {self.pretty_name} ({self.name}), ID: {self.chain_id}, Prefix: {self.bech32_prefix}, Endpoints: {endpoints_str}"
 
 
 class CosmosStakingQueryTool:
@@ -79,6 +155,9 @@ class CosmosStakingQueryTool:
         # Track pagination errors to adjust pagination size adaptively
         self.pagination_error_count = {}  # Chain name -> error count
         self.chain_pagination_sizes = {}  # Chain name -> current pagination size
+        
+        # Track which request is at which concurrency level
+        self.request_counter = defaultdict(int)
     
     async def run(self):
         """Main execution function to process all chains."""
@@ -121,44 +200,86 @@ class CosmosStakingQueryTool:
         logger.info(f"Fetching config for {chain_config.name} from {url}")
         
         try:
-            async with session.get(url) as response:
+            async with session.get(url, timeout=30) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch config for {chain_config.name}: HTTP {response.status}")
-                    return
+                    # Try with normalized name (sometimes directory uses different naming)
+                    alt_name = chain_config.name.replace('hub', '')
+                    alt_url = f"https://chains.cosmos.directory/{alt_name}"
+                    
+                    if alt_name != chain_config.name:
+                        logger.info(f"Trying alternative name: {alt_name}")
+                        try:
+                            async with session.get(alt_url, timeout=30) as alt_response:
+                                if alt_response.status == 200:
+                                    data = await alt_response.json()
+                                    logger.info(f"Successfully fetched config using alternative name {alt_name}")
+                                else:
+                                    logger.error(f"Failed with alternative name too: HTTP {alt_response.status}")
+                                    return
+                        except Exception as e:
+                            logger.error(f"Error with alternative name: {str(e)}")
+                            return
+                    else:
+                        return
+                else:
+                    data = await response.json()
                 
-                data = await response.json()
+                # Extract chain data from response
+                if "chain" not in data:
+                    logger.error(f"Invalid response format from {url}: 'chain' field missing")
+                    return
+                    
                 chain_data = data.get("chain", {})
                 
                 chain_config.pretty_name = chain_data.get("pretty_name", chain_config.name)
                 chain_config.chain_id = chain_data.get("chain_id", "")
                 chain_config.bech32_prefix = chain_data.get("bech32_prefix", "")
                 
-                # Get REST endpoint
+                # Get REST endpoints
                 apis = chain_data.get("apis", {})
                 rest_endpoints = apis.get("rest", [])
-                if rest_endpoints:
-                    # Prefer cosmos.directory REST endpoint if available
-                    for endpoint in rest_endpoints:
-                        if "cosmos.directory" in endpoint.get("address", ""):
-                            chain_config.rest_endpoint = endpoint.get("address")
-                            break
-                    
-                    # Otherwise take the first one
-                    if not chain_config.rest_endpoint and rest_endpoints:
-                        chain_config.rest_endpoint = rest_endpoints[0].get("address")
                 
-                # Double check with predefined endpoint if rest endpoint wasn't found
-                if not chain_config.rest_endpoint:
-                    chain_config.rest_endpoint = f"https://rest.cosmos.directory/{chain_config.name}"
+                if rest_endpoints:
+                    # Add all REST endpoints
+                    for endpoint in rest_endpoints:
+                        address = endpoint.get("address", "")
+                        provider = endpoint.get("provider", "")
+                        if address:
+                            chain_config.add_rest_endpoint(address, provider)
+                            logger.debug(f"Added REST endpoint {address} for {chain_config.name} (provider: {provider})")
+                
+                # Fallback to a default endpoint if none found
+                if not chain_config.rest_endpoints:
+                    logger.warning(f"No REST endpoints found for {chain_config.name}, adding default")
+                    
+                    # Try multiple possible default endpoints
+                    default_endpoints = [
+                        f"https://rest.cosmos.directory/{chain_config.name}",
+                        f"https://lcd-{chain_config.name}.keplr.app",
+                        f"https://api.{chain_config.name}.zone"
+                    ]
+                    
+                    for endpoint in default_endpoints:
+                        chain_config.add_rest_endpoint(endpoint, "default fallback")
                 
                 chain_config.is_configured = all([
                     chain_config.chain_id,
                     chain_config.bech32_prefix,
-                    chain_config.rest_endpoint
+                    len(chain_config.rest_endpoints) > 0
                 ])
                 
-                logger.info(f"Config for {chain_config.name}: {chain_config}")
+                if chain_config.is_configured:
+                    logger.info(f"Successfully configured {chain_config.name}: {chain_config}")
+                else:
+                    logger.warning(f"Incomplete configuration for {chain_config.name}: missing " + 
+                                  ", ".join(["chain_id"] if not chain_config.chain_id else []) +
+                                  ", ".join(["bech32_prefix"] if not chain_config.bech32_prefix else []) +
+                                  ", ".join(["rest_endpoints"] if not chain_config.rest_endpoints else []))
         
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching config for {chain_config.name}")
+            raise
         except Exception as e:
             logger.error(f"Error fetching config for {chain_config.name}: {str(e)}")
             raise
@@ -184,7 +305,7 @@ class CosmosStakingQueryTool:
             failed_validators = []
             
             # Smaller batch size to reduce rate limiting
-            batch_size = 2  # Reduced from 5 to 2 validators at a time
+            batch_size = 5 
             
             with tqdm(total=len(validators), desc=f"Processing {chain_config.name} validators") as pbar:
                 for i in range(0, len(validators), batch_size):
@@ -206,13 +327,16 @@ class CosmosStakingQueryTool:
                     
                     # Flatten results and add to list
                     for delegator_list in batch_results:
+                        # Add chain name to each delegation record
+                        for delegation in delegator_list:
+                            delegation["chain"] = chain_config.name
                         delegator_data_list.extend(delegator_list)
                     
                     pbar.update(len(validator_batch))
                     
                     # Add delay between batches to avoid rate limiting
                     logger.info(f"Completed batch. Waiting before next batch...")
-                    await asyncio.sleep(random.uniform(5.0, 10.0))
+                    await asyncio.sleep(random.uniform(2.0, 5.0))
             
             # Record any failed validators
             if failed_validators:
@@ -223,6 +347,9 @@ class CosmosStakingQueryTool:
             if failed_validators and self.enable_recovery:
                 logger.info(f"Attempting recovery for {len(failed_validators)} failed validators with extended backoff")
                 recovered_data = await self.recover_failed_validators(session, chain_config, failed_validators)
+                # Add chain name to each recovered delegation record
+                for delegation in recovered_data:
+                    delegation["chain"] = chain_config.name
                 delegator_data_list.extend(recovered_data)
             elif failed_validators:
                 logger.warning(f"Recovery mode disabled - skipping recovery attempts for {len(failed_validators)} validators")
@@ -248,296 +375,404 @@ class CosmosStakingQueryTool:
                 
                 chain_data["stakers"] = stakers
                 chain_data["total_stakers"] = len(stakers)
-                chain_data["total_staked"] = int(stakers_df["staked_amount"].sum())
-                chain_data["denom"] = stakers_df["denom"].iloc[0] if not stakers_df.empty else ""
                 
-                logger.info(f"Processed {len(stakers)} unique delegators for {chain_config.name}")
+                # Sum the total staked amount
+                chain_data["total_staked"] = int(stakers_df["staked_amount"].sum())
+                
+                # Add the denom if we have stakers
+                if len(stakers_df) > 0:
+                    chain_data["denom"] = stakers_df.iloc[0]["denom"]
+                
+                # Add API endpoint info including error counts
+                chain_data["api_endpoints"] = chain_config.get_endpoints_report()
+                
+                logger.info(f"Processed {len(stakers)} stakers for {chain_config.name}")
             else:
-                logger.warning(f"No delegator data found for {chain_config.name}")
+                logger.warning(f"No staker data found for {chain_config.name}")
             
             return chain_data
                 
         except Exception as e:
             logger.error(f"Error processing chain {chain_config.name}: {str(e)}")
+            # Return a minimal chain data structure with error info
+            chain_data["error"] = str(e)
             return chain_data
             
     async def recover_failed_validators(self, session: aiohttp.ClientSession, 
                                       chain_config: ChainConfig, 
                                       validators: List[str]) -> List[Dict]:
         """
-        Last-ditch effort to recover data from validators that failed even after multiple retries.
-        Uses much longer delays between attempts and a more conservative approach.
+        Attempt to recover data for validators that failed during regular processing.
+        
+        This uses a more aggressive approach with longer delays and smaller page sizes.
         """
-        all_recovered_delegations = []
+        logger.info(f"Starting recovery process for {len(validators)} validators on {chain_config.name}")
+        all_recovered = []
         
-        # Group validators by whether they likely failed due to rate limiting
-        rate_limited_validators = []
-        other_error_validators = []
-        
-        for validator in validators:
-            # Check if this validator was rate limited based on the error log
-            if any(f"validator {validator}" in entry and "429" in entry for entry in self.get_recent_error_logs()):
-                rate_limited_validators.append(validator)
-            else:
-                other_error_validators.append(validator)
-                
-        if rate_limited_validators:
-            logger.info(f"Attempting recovery for {len(rate_limited_validators)} rate-limited validators with extra caution")
-            
-        # Process non-rate-limited validators first
-        for validator in tqdm(other_error_validators, desc=f"Recovery attempts for {chain_config.name} (regular errors)"):
-            recovered_delegations = await self.attempt_validator_recovery(session, chain_config, validator, 
-                                                    max_attempts=3, base_delay=10)
-            if recovered_delegations:
-                all_recovered_delegations.extend(recovered_delegations)
-                
-        # Then process rate-limited validators with much more caution
-        for validator in tqdm(rate_limited_validators, desc=f"Recovery attempts for {chain_config.name} (rate-limited)"):
-            # Much longer delays between attempts for rate-limited validators
-            recovered_delegations = await self.attempt_validator_recovery(session, chain_config, validator, 
-                                                    max_attempts=3, base_delay=60, 
-                                                    pagination_delay_range=(5, 15))
-            if recovered_delegations:
-                all_recovered_delegations.extend(recovered_delegations)
-                
-        return all_recovered_delegations
-        
-    def get_recent_error_logs(self) -> List[str]:
-        """Gets recent error logs from the logger to identify rate-limited validators."""
-        # This is a simple implementation; in a production environment,
-        # you might want to use a more sophisticated approach to access logs
-        try:
-            with open(next(Path(".").glob("staking_query_*.log")), 'r') as f:
-                return [line for line in f.readlines() if "ERROR" in line and ("429" in line or "rate" in line.lower())]
-        except (StopIteration, FileNotFoundError, PermissionError):
-            return []  # Return empty list if no log file found or can't read it
-    
-    async def attempt_validator_recovery(self, session: aiohttp.ClientSession, 
-                                       chain_config: ChainConfig, validator: str,
-                                       max_attempts: int = 3, base_delay: int = 10,
-                                       pagination_delay_range: tuple = (2, 5)) -> List[Dict]:
-        """Helper method to attempt recovery for a single validator with customizable parameters."""
-        recovered = False
-        delegations = []
-        
-        for attempt in range(1, max_attempts + 1):
-            try:
-                logger.info(f"Recovery attempt {attempt}/{max_attempts} for validator {validator}")
-                # Extended delay before retry - increases with each attempt
-                delay = base_delay * attempt
-                logger.info(f"Waiting {delay}s before attempting...")
-                await asyncio.sleep(delay)
-                
-                # Custom implementation without using the retry decorator
-                next_key = None
-                
-                while True:
-                    endpoint = f"{chain_config.rest_endpoint}/cosmos/staking/v1beta1/validators/{validator}/delegations"
-                    # Use adaptive pagination size based on chain's error rate
-                    pagination_size = self.get_pagination_size_for_chain(chain_config.name, "recovery")
-                    params = {"pagination.limit": str(pagination_size)}
-                    
-                    if next_key:
-                        params["pagination.key"] = next_key
-                    
-                    async with session.get(endpoint, params=params, timeout=60) as response:
-                        if response.status == 429:
-                            # If rate limited during recovery, use an even longer delay
-                            error_text = await response.text()
-                            retry_after = response.headers.get('Retry-After')
-                            wait_time = int(retry_after) if retry_after and retry_after.isdigit() else random.randint(60, 120)
-                            
-                            logger.warning(f"Rate limited during recovery for {validator}. Waiting {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                            break  # Break out of pagination and retry the whole validator
-                            
-                        if response.status != 200:
-                            error_text = await response.text()
-                            logger.warning(f"Recovery attempt {attempt} failed with HTTP {response.status}: {error_text}")
-                            break
-                        
-                        data = await response.json()
-                        
-                        # Extract delegator info
-                        for delegation in data.get("delegation_responses", []):
-                            delegator_addr = delegation.get("delegation", {}).get("delegator_address")
-                            balance = delegation.get("balance", {})
-                            
-                            if delegator_addr and balance:
-                                amount = int(balance.get("amount", 0))
-                                denom = balance.get("denom", "")
-                                
-                                if amount > 0:
-                                    delegations.append({
-                                        "chain": chain_config.name,
-                                        "address": delegator_addr,
-                                        "staked_amount": amount,
-                                        "denom": denom
-                                    })
-                        
-                        # Check for pagination
-                        pagination = data.get("pagination", {})
-                        next_key = pagination.get("next_key")
-                        
-                        if not next_key:
-                            recovered = True
-                            break
-                        
-                        # Extra delay for pagination in recovery mode - use the custom range
-                        min_delay, max_delay = pagination_delay_range
-                        await asyncio.sleep(random.uniform(min_delay, max_delay))
-                
-                if recovered:
-                    logger.info(f"Successfully recovered {len(delegations)} delegations for validator {validator}")
-                    break
-            
-            except Exception as e:
-                logger.warning(f"Recovery attempt {attempt} failed for validator {validator}: {str(e)}")
-        
-        if not recovered:
-            logger.error(f"All recovery attempts failed for validator {validator}")
-            
-        return delegations
-    
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=60))
-    async def get_all_validators(self, session: aiohttp.ClientSession, chain_config: ChainConfig) -> List[str]:
-        """
-        Get all validators for a chain, handling pagination.
-        Returns a list of validator addresses.
-        """
-        validators = []
-        next_key = None
-        
-        while True:
-            endpoint = f"{chain_config.rest_endpoint}/cosmos/staking/v1beta1/validators"
-            params = {"pagination.limit": "150"}
-            
-            if next_key:
-                params["pagination.key"] = next_key
+        # Process one validator at a time for recovery
+        for i, validator in enumerate(validators):
+            logger.info(f"Recovery attempt {i+1}/{len(validators)} for validator {validator}")
             
             try:
-                async with session.get(endpoint, params=params) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"Failed to get validators for {chain_config.name}: HTTP {response.status}\n{error_text}")
-                        return validators
-                    
-                    data = await response.json()
-                    
-                    # Extract validator operator addresses
-                    for validator in data.get("validators", []):
-                        validator_addr = validator.get("operator_address")
-                        if validator_addr:
-                            validators.append(validator_addr)
-                    
-                    # Check for pagination
-                    pagination = data.get("pagination", {})
-                    next_key = pagination.get("next_key")
-                    
-                    if not next_key:
-                        break
-                    
-                    # To avoid rate limiting
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
-            
+                # Use a dedicated recovery method with more aggressive retry logic
+                recovered_delegations = await self.attempt_validator_recovery(
+                    session, chain_config, validator, 
+                    max_attempts=3, base_delay=10, pagination_delay_range=(2, 5)
+                )
+                
+                if recovered_delegations:
+                    logger.info(f"Recovered {len(recovered_delegations)} delegations for validator {validator}")
+                    all_recovered.extend(recovered_delegations)
+                else:
+                    logger.warning(f"No delegations recovered for validator {validator}")
+                
+                # Add a delay between validators to avoid rate limiting
+                await asyncio.sleep(random.uniform(5, 10))
+                
             except Exception as e:
-                logger.error(f"Error fetching validators for {chain_config.name}: {str(e)}")
-                raise
+                logger.error(f"Error during recovery for validator {validator}: {str(e)}")
+                # Continue with next validator
         
-        return validators
+        logger.info(f"Recovery complete. Recovered data for {len(all_recovered)} delegations across {len(validators)} validators")
+        return all_recovered
     
     @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=5, max=300))
     async def get_validator_delegations(self, session: aiohttp.ClientSession, 
                                        chain_config: ChainConfig, validator_addr: str) -> List[Dict]:
         """
-        Get all delegations for a validator, handling pagination.
-        Returns a list of delegator data dicts.
+        Get all delegations for a validator.
         
-        Uses aggressive exponential backoff to handle rate limiting.
+        Args:
+            session: The aiohttp session to use
+            chain_config: The chain configuration
+            validator_addr: The validator address
+            
+        Returns:
+            List of delegations with amounts
         """
         delegations = []
         next_key = None
+        page_count = 0
+        failures = 0
+        request_id = f"delegations_{validator_addr[-8:]}_{int(time.time())}"
+        pagination_size = self.get_pagination_size_for_chain(chain_config.name)
+        errors_by_endpoint = {}  # Track which endpoints fail with which pagination keys
         
-        # Add a random initial delay to stagger requests
-        await asyncio.sleep(random.uniform(1.0, 3.0))
+        logger.info(f"Getting delegations for validator {validator_addr} on {chain_config.name}")
         
-        while True:
-            endpoint = f"{chain_config.rest_endpoint}/cosmos/staking/v1beta1/validators/{validator_addr}/delegations"
-            # Use adaptive pagination size based on chain's error rate
-            pagination_size = self.get_pagination_size_for_chain(chain_config.name, "delegations")
-            params = {"pagination.limit": str(pagination_size)}
-            
-            if next_key:
-                params["pagination.key"] = next_key
-            
-            try:
-                async with session.get(endpoint, params=params, timeout=60) as response:
-                    # Special handling for rate limiting
-                    if response.status == 429:
-                        error_text = await response.text()
-                        retry_after = response.headers.get('Retry-After')
-                        wait_time = int(retry_after) if retry_after and retry_after.isdigit() else random.randint(30, 60)
-                        
-                        logger.warning(f"Rate limited (429) for validator {validator_addr} on {chain_config.name}. Waiting {wait_time}s before retry.")
-                        # Record the error to potentially reduce pagination size
-                        self.record_pagination_error(chain_config.name)
-                        await asyncio.sleep(wait_time)
-                        raise Exception(f"Rate limited: {error_text}")
-                    
-                    # Check for other potential pagination-related errors
-                    if response.status in [500, 502, 503, 504]:
-                        error_text = await response.text()
-                        logger.warning(f"Server error for validator {validator_addr} on {chain_config.name}: HTTP {response.status}")
-                        # Record error to potentially reduce pagination size on server errors
-                        self.record_pagination_error(chain_config.name)
-                        raise Exception(f"HTTP {response.status} from API: {error_text}")
-                    
-                    if response.status != 200:
-                        # Don't immediately skip validators with error responses
-                        # The @retry decorator will handle retrying this function
-                        error_text = await response.text()
-                        logger.error(f"Failed to get delegations for validator {validator_addr} on {chain_config.name}: HTTP {response.status}\n{error_text}")
-                        raise Exception(f"HTTP {response.status} from API")
-                    
-                    data = await response.json()
-                    
-                    # Extract delegator info
-                    for delegation in data.get("delegation_responses", []):
-                        delegator_addr = delegation.get("delegation", {}).get("delegator_address")
-                        balance = delegation.get("balance", {})
-                        
-                        if delegator_addr and balance:
-                            amount = int(balance.get("amount", 0))
-                            denom = balance.get("denom", "")
-                            
-                            if amount > 0:
-                                delegations.append({
-                                    "chain": chain_config.name,
-                                    "address": delegator_addr,
-                                    "staked_amount": amount,
-                                    "denom": denom
-                                })
-                    
-                    # Check for pagination
-                    pagination = data.get("pagination", {})
-                    next_key = pagination.get("next_key")
-                    
-                    if not next_key:
-                        break
-                    
-                    # More aggressive delay for pagination to avoid rate limiting
-                    await asyncio.sleep(random.uniform(3.0, 8.0))
-            
-            except Exception as e:
-                # If we hit a rate limit, re-raise to trigger exponential backoff
-                if "Rate limited" in str(e) or "429" in str(e):
-                    logger.warning(f"Rate limit encountered for {validator_addr}, triggering backoff...")
-                    raise
+        try:
+            while True:
+                page_count += 1
                 
-                logger.error(f"Error fetching delegations for validator {validator_addr} on {chain_config.name}: {str(e)}")
-                raise
+                # Create pagination params - with proper encoding
+                if next_key:
+                    # URL-encode the pagination key
+                    encoded_key = urllib.parse.quote(next_key)
+                    pagination_params = f"pagination.limit={pagination_size}&pagination.key={encoded_key}"
+                else:
+                    pagination_params = f"pagination.limit={pagination_size}"
+                
+                endpoint_path = f"cosmos/staking/v1beta1/validators/{validator_addr}/delegations?{pagination_params}"
+                
+                # Try multiple endpoints for this pagination request
+                success = False
+                last_error = None
+                attempted_endpoints = []
+                
+                # Try up to 3 different endpoints
+                for attempt in range(min(3, len(chain_config.rest_endpoints))):
+                    try:
+                        # Get an endpoint that hasn't failed with this pagination key
+                        offset = attempt
+                        while offset < len(chain_config.rest_endpoints):
+                            endpoint = chain_config.get_rest_endpoint(offset)
+                            # Skip endpoints that have already failed with this key
+                            if next_key and endpoint in errors_by_endpoint.get(next_key, []):
+                                offset += 1
+                                continue
+                            break
+                            
+                        if offset >= len(chain_config.rest_endpoints):
+                            # We've exhausted all endpoints for this pagination key
+                            break
+                            
+                        attempted_endpoints.append(endpoint)
+                        
+                        # Custom request to handle pagination issues
+                        url = f"{endpoint.rstrip('/')}/{endpoint_path}"
+                        logger.debug(f"Requesting delegations (page {page_count}) from {url}")
+                        
+                        async with session.get(url, timeout=30) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                
+                                # Extract delegations from response
+                                page_delegations = result.get("delegation_responses", [])
+                                for delegation in page_delegations:
+                                    delegator_address = delegation.get("delegation", {}).get("delegator_address", "")
+                                    balance = delegation.get("balance", {})
+                                    
+                                    if delegator_address and balance:
+                                        amount = int(balance.get("amount", "0"))
+                                        denom = balance.get("denom", "")
+                                        
+                                        delegations.append({
+                                            "address": delegator_address,
+                                            "staked_amount": amount,
+                                            "denom": denom,
+                                            "validator": validator_addr
+                                        })
+                                
+                                # Check if there are more pages
+                                pagination = result.get("pagination", {})
+                                next_key = pagination.get("next_key")
+                                
+                                success = True
+                                break  # We got data successfully
+                            else:
+                                # Record endpoint as failing with this pagination key
+                                if next_key:
+                                    if next_key not in errors_by_endpoint:
+                                        errors_by_endpoint[next_key] = []
+                                    errors_by_endpoint[next_key].append(endpoint)
+                                
+                                chain_config.record_endpoint_error(endpoint)
+                                error_text = await response.text()
+                                last_error = f"HTTP error {response.status} from {url}: {error_text}"
+                                logger.warning(f"Endpoint {endpoint} failed with status {response.status} for delegations page {page_count}")
+                                
+                    except asyncio.TimeoutError:
+                        chain_config.record_endpoint_error(endpoint)
+                        last_error = f"Timeout error querying {url}"
+                        logger.warning(f"Timeout error for endpoint {endpoint}")
+                    except Exception as e:
+                        chain_config.record_endpoint_error(endpoint)
+                        last_error = f"Error querying {url}: {str(e)}"
+                        logger.warning(f"Error for endpoint {endpoint}: {str(e)}")
+                
+                if not success:
+                    # All endpoints failed for this pagination request
+                    failures += 1
+                    if failures >= 3:  # Try a few times before giving up
+                        logger.error(f"Persistent errors getting delegations for validator {validator_addr}: {last_error}")
+                        self.record_pagination_error(chain_config.name)
+                        if page_count == 1:
+                            # If we can't even get the first page, that's a fatal error
+                            raise Exception(f"Failed to get any delegations for validator {validator_addr}")
+                        else:
+                            # If we already have some delegations, we'll continue with what we have
+                            logger.warning(f"Stopping pagination after getting {len(delegations)} delegations")
+                            break
+                    
+                    # Wait and retry with a different set of endpoints
+                    logger.warning(f"All endpoints failed for page {page_count}, waiting before retry")
+                    await asyncio.sleep(random.uniform(2.0, 5.0))
+                    continue
+                
+                # Reset failures counter on success
+                failures = 0
+                
+                # If no more pages, we're done
+                if not next_key:
+                    break
+                    
+                # Add a small delay between pagination requests to avoid rate limiting
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+            
+            logger.info(f"Retrieved {len(delegations)} delegations for validator {validator_addr} in {page_count} pages")
+            return delegations
+            
+        except Exception as e:
+            logger.error(f"Error fetching delegations for validator {validator_addr} on {chain_config.name}: {str(e)}")
+            raise
+    
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=60))
+    async def get_all_validators(self, session: aiohttp.ClientSession, chain_config: ChainConfig) -> List[str]:
+        """
+        Get all validator addresses for a chain.
         
-        return delegations
+        Args:
+            session: The aiohttp session to use
+            chain_config: The chain configuration
+            
+        Returns:
+            List of validator addresses
+        """
+        validators = []
+        next_key = None
+        page_count = 0
+        request_id = f"validators_{chain_config.name}_{int(time.time())}"
+        errors_by_endpoint = {}  # Track which endpoints fail with which pagination keys
+        
+        try:
+            while True:
+                page_count += 1
+                
+                # Create pagination params - important to properly encode the pagination key
+                if next_key:
+                    # URL-encode the pagination key to ensure special characters are handled properly
+                    encoded_key = urllib.parse.quote(next_key)
+                    pagination_params = f"pagination.limit=100&pagination.key={encoded_key}"
+                else:
+                    pagination_params = "pagination.limit=100"
+                
+                endpoint_path = f"cosmos/staking/v1beta1/validators?{pagination_params}"
+                
+                # Try multiple endpoints until one works
+                success = False
+                last_error = None
+                attempted_endpoints = []
+                
+                # Try up to 3 different endpoints for this pagination request
+                for attempt in range(min(3, len(chain_config.rest_endpoints))):
+                    try:
+                        # Get an endpoint that hasn't failed with this pagination key before
+                        offset = attempt
+                        while offset < len(chain_config.rest_endpoints):
+                            endpoint = chain_config.get_rest_endpoint(offset)
+                            # Skip endpoints that have already failed with this pagination key
+                            if next_key and endpoint in errors_by_endpoint.get(next_key, []):
+                                offset += 1
+                                continue
+                            break
+                        
+                        if offset >= len(chain_config.rest_endpoints):
+                            # We've exhausted all endpoints for this pagination key
+                            break
+                            
+                        attempted_endpoints.append(endpoint)
+                        
+                        # Custom request instead of using make_request to handle pagination issues
+                        url = f"{endpoint.rstrip('/')}/{endpoint_path}"
+                        logger.debug(f"Requesting validators (page {page_count}) from {url}")
+                        
+                        async with session.get(url) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                
+                                # Extract validators from response
+                                page_validators = result.get("validators", [])
+                                for validator in page_validators:
+                                    validator_address = validator.get("operator_address", "")
+                                    if validator_address:
+                                        validators.append(validator_address)
+                                
+                                # Check if there are more pages
+                                pagination = result.get("pagination", {})
+                                next_key = pagination.get("next_key")
+                                
+                                success = True
+                                break  # We successfully got data from this endpoint
+                            else:
+                                # Record the endpoint as failing with this pagination key
+                                if next_key:
+                                    if next_key not in errors_by_endpoint:
+                                        errors_by_endpoint[next_key] = []
+                                    errors_by_endpoint[next_key].append(endpoint)
+                                
+                                chain_config.record_endpoint_error(endpoint)
+                                error_text = await response.text()
+                                last_error = f"HTTP error {response.status} from {url}: {error_text}"
+                                logger.warning(f"Endpoint {endpoint} failed with status {response.status} for validators page {page_count}")
+                    
+                    except Exception as e:
+                        chain_config.record_endpoint_error(endpoint)
+                        last_error = f"Error querying {url}: {str(e)}"
+                        logger.warning(f"Endpoint {endpoint} failed with error: {str(e)}")
+                
+                if not success:
+                    # All endpoints failed for this pagination request
+                    if page_count == 1:
+                        # If we can't even get the first page, that's a fatal error
+                        logger.error(f"All endpoints failed to get validators page {page_count}. Last error: {last_error}")
+                        raise Exception(f"Failed to get validators from any endpoint. Tried: {', '.join(attempted_endpoints)}")
+                    else:
+                        # If we've already got some validators, we can continue with what we have
+                        logger.warning(f"All endpoints failed for pagination key '{next_key}'. Stopping pagination.")
+                        break
+                
+                # Exit loop if we've reached the end of pagination
+                if not next_key:
+                    break
+                    
+                # Add a small delay between pagination requests to avoid rate limiting
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                
+            logger.info(f"Retrieved {len(validators)} validators for {chain_config.name} in {page_count} pages")
+            return validators
+            
+        except Exception as e:
+            logger.error(f"Error fetching validators for {chain_config.name}: {str(e)}")
+            raise
+    
+    def finalize_results(self):
+        """Process and save the final results to a JSON file."""
+        try:
+            # Calculate total stakers count across all chains
+            total_stakers = 0
+            total_validators_failed = 0
+            
+            # Add metadata to each chain's data
+            for chain_name, chain_data in self.all_stakers_data.items():
+                stakers = chain_data.get("stakers", {})
+                
+                # Add statistics
+                chain_data["total_stakers"] = len(stakers)
+                total_stakers += len(stakers)
+                
+                # Calculate total staked amount for this chain
+                total_staked = sum(staker_data.get("amount", 0) for staker_data in stakers.values())
+                chain_data["total_staked"] = total_staked
+                
+                # Add common denom info if available
+                if stakers:
+                    # Get the denom from the first staker (they should all be the same)
+                    first_staker = next(iter(stakers.values()))
+                    chain_data["denom"] = first_staker.get("denom", "")
+                
+                # Add API endpoint info including error counts
+                chain_config = self.chain_configs.get(chain_name)
+                if chain_config:
+                    chain_data["api_endpoints"] = chain_config.get_endpoints_report()
+            
+            # Count total failed validators
+            for failed_list in self.failed_validators.values():
+                total_validators_failed += len(failed_list)
+            
+            # Create the final output structure
+            result = {
+                "metadata": {
+                    "generated_at": datetime.now().isoformat(),
+                    "chains_processed": len(self.all_stakers_data),
+                    "total_stakers": total_stakers,
+                    "total_validators_failed": total_validators_failed
+                },
+                "chains": self.all_stakers_data
+            }
+            
+            # Save to file
+            with open(self.output_file, 'w') as f:
+                json.dump(result, f, indent=2)
+                
+            logger.info(f"Results saved to {self.output_file}")
+            logger.info(f"Processed {len(self.all_stakers_data)} chains with a total of {total_stakers} unique stakers")
+            
+            if total_validators_failed > 0:
+                logger.warning(f"Failed to process {total_validators_failed} validators across all chains")
+                
+                # Log detailed info about failed validators by chain
+                for chain_name, failed_list in self.failed_validators.items():
+                    logger.warning(f"Chain {chain_name}: {len(failed_list)} failed validators")
+            
+            # Save report of failed validators
+            if self.failed_validators:
+                failed_report_path = f"failed_validators_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(failed_report_path, 'w') as f:
+                    json.dump(self.failed_validators, f, indent=2)
+                logger.warning(f"Some validators failed all retry attempts. See {failed_report_path} for details.")
+            
+        except Exception as e:
+            logger.error(f"Error finalizing results: {str(e)}")
     
     def get_pagination_size_for_chain(self, chain_name: str, request_type: str = "delegations") -> int:
         """
@@ -596,53 +831,147 @@ class CosmosStakingQueryTool:
         self.pagination_error_count[chain_name] += 1
         logger.warning(f"Recorded pagination error for {chain_name} (total: {self.pagination_error_count[chain_name]})")
     
-    def finalize_results(self):
-        """Process the results and save to JSON file."""
-        logger.info("Finalizing and saving results")
+    async def attempt_validator_recovery(self, session: aiohttp.ClientSession, 
+                                      chain_config: ChainConfig, validator: str,
+                                      max_attempts: int = 3, base_delay: int = 10,
+                                      pagination_delay_range: tuple = (2, 5)) -> List[Dict]:
+        """
+        Make aggressive attempts to recover data for a validator that failed initial processing.
         
-        try:
-            # Prepare final output data
-            output_data = {
-                "metadata": {
-                    "generated_at": datetime.now().isoformat(),
-                    "chains_processed": len(self.all_stakers_data),
-                    "total_validators_failed": sum(len(validators) for validators in self.failed_validators.values()) if self.failed_validators else 0
-                },
-                "chains": self.all_stakers_data
-            }
+        Uses longer delays and more careful pagination handling to maximize chances of success.
+        """
+        delegations = []
+        next_key = None
+        attempt = 0
+        request_id = f"recovery_{validator[-8:]}_{int(time.time())}"
+        errors_by_endpoint = {}  # Track which endpoints fail with which pagination keys
+        
+        while attempt < max_attempts:
+            attempt += 1
+            logger.info(f"Recovery attempt {attempt}/{max_attempts} for validator {validator} on {chain_config.name}")
             
-            # Save to JSON file
-            with open(self.output_file, 'w') as f:
-                json.dump(output_data, f, indent=2)
-            
-            logger.info(f"Saved staker data to {self.output_file}")
-            
-            # Print summary
-            total_stakers = 0
-            for chain_name, chain_data in self.all_stakers_data.items():
-                stakers_count = chain_data.get("total_stakers", 0)
-                total_staked = chain_data.get("total_staked", 0)
-                denom = chain_data.get("denom", "")
-                logger.info(f"Chain {chain_name}: {stakers_count} stakers, {total_staked} {denom} total staked")
-                total_stakers += stakers_count
-            
-            logger.info(f"Total unique stakers across {len(self.all_stakers_data)} chains: {total_stakers}")
-            
-            # Save report of failed validators
-            if self.failed_validators:
-                failed_report_path = f"failed_validators_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                with open(failed_report_path, 'w') as f:
-                    json.dump(self.failed_validators, f, indent=2)
-                logger.warning(f"Some validators failed all retry attempts. See {failed_report_path} for details.")
+            try:
+                # Exponential backoff between attempts
+                if attempt > 1:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.info(f"Waiting {delay}s before retry...")
+                    await asyncio.sleep(delay)
                 
-                # Print summary of failed validators
-                total_failed = sum(len(validators) for validators in self.failed_validators.values())
-                logger.warning(f"Total failed validators: {total_failed} across {len(self.failed_validators)} chains")
+                # Use a very small pagination size for recovery attempts
+                pagination_size = min(20, self.get_pagination_size_for_chain(chain_config.name, "recovery"))
+                page_count = 0
+                
+                while True:
+                    page_count += 1
+                    # Create pagination params with proper encoding
+                    if next_key:
+                        encoded_key = urllib.parse.quote(next_key)
+                        pagination_params = f"pagination.limit={pagination_size}&pagination.key={encoded_key}"
+                    else:
+                        pagination_params = f"pagination.limit={pagination_size}"
+                    
+                    endpoint_path = f"cosmos/staking/v1beta1/validators/{validator}/delegations?{pagination_params}"
+                    
+                    # Try multiple endpoints for this pagination request
+                    success = False
+                    last_error = None
+                    attempted_endpoints = []
+                    
+                    # Try up to 3 different endpoints
+                    for endpoint_attempt in range(min(3, len(chain_config.rest_endpoints))):
+                        try:
+                            # Get an endpoint that hasn't failed with this pagination key
+                            offset = endpoint_attempt
+                            while offset < len(chain_config.rest_endpoints):
+                                endpoint = chain_config.get_rest_endpoint(offset)
+                                # Skip endpoints that have already failed with this key
+                                if next_key and endpoint in errors_by_endpoint.get(next_key, []):
+                                    offset += 1
+                                    continue
+                                break
+                                
+                            if offset >= len(chain_config.rest_endpoints):
+                                # We've exhausted all endpoints for this pagination key
+                                break
+                                
+                            attempted_endpoints.append(endpoint)
+                            
+                            # Custom request with longer timeout for recovery
+                            url = f"{endpoint.rstrip('/')}/{endpoint_path}"
+                            logger.debug(f"Recovery request for delegations (page {page_count}) from {url}")
+                            
+                            async with session.get(url, timeout=60) as response:
+                                if response.status == 200:
+                                    result = await response.json()
+                                    
+                                    # Extract delegations from response
+                                    page_delegations = result.get("delegation_responses", [])
+                                    for delegation in page_delegations:
+                                        delegator_address = delegation.get("delegation", {}).get("delegator_address", "")
+                                        balance = delegation.get("balance", {})
+                                        
+                                        if delegator_address and balance:
+                                            amount = int(balance.get("amount", "0"))
+                                            denom = balance.get("denom", "")
+                                            
+                                            delegations.append({
+                                                "address": delegator_address,
+                                                "staked_amount": amount,
+                                                "denom": denom,
+                                                "validator": validator
+                                            })
+                                    
+                                    # Check if there are more pages
+                                    pagination = result.get("pagination", {})
+                                    next_key = pagination.get("next_key")
+                                    
+                                    success = True
+                                    break  # We got data successfully
+                                else:
+                                    # Record endpoint as failing with this pagination key
+                                    if next_key:
+                                        if next_key not in errors_by_endpoint:
+                                            errors_by_endpoint[next_key] = []
+                                        errors_by_endpoint[next_key].append(endpoint)
+                                    
+                                    chain_config.record_endpoint_error(endpoint)
+                                    error_text = await response.text()
+                                    last_error = f"HTTP error {response.status} from {url}: {error_text}"
+                                    logger.warning(f"Recovery endpoint {endpoint} failed with status {response.status}")
+                                    
+                        except Exception as e:
+                            chain_config.record_endpoint_error(endpoint)
+                            last_error = f"Error in recovery for {validator}: {str(e)}"
+                            logger.warning(f"Recovery error for endpoint {endpoint}: {str(e)}")
+                    
+                    if not success:
+                        # All endpoints failed for this pagination request during recovery
+                        logger.warning(f"All recovery endpoints failed for page {page_count}. Last error: {last_error}")
+                        # If we have some data, return it, otherwise continue to next attempt
+                        if delegations:
+                            logger.info(f"Partial recovery successful, got {len(delegations)} delegations before failure")
+                            return delegations
+                        else:
+                            break  # Try again with next attempt
+                    
+                    # If no more pages, we're done with this attempt
+                    if not next_key:
+                        logger.info(f"Recovery successful for validator {validator}, got {len(delegations)} delegations")
+                        return delegations
+                    
+                    # Add a delay between pagination requests
+                    min_delay, max_delay = pagination_delay_range
+                    await asyncio.sleep(random.uniform(min_delay, max_delay))
+            
+            except Exception as e:
+                logger.warning(f"Recovery attempt {attempt} failed for validator {validator}: {str(e)}")
+                # Continue to next attempt
         
-        except Exception as e:
-            logger.error(f"Error finalizing results: {str(e)}")
-
-
+        # If we got here, we've exhausted all recovery attempts
+        logger.error(f"All recovery attempts failed for validator {validator} on {chain_config.name}")
+        # Return any delegations we might have collected
+        return delegations
+    
 async def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(description="Query staking data from Cosmos chains")
@@ -730,4 +1059,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Process interrupted by user")
     except Exception as e:
-        logger.error(f"Unhandled exception: {str(e)}", exc_info=True) 
+        logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+    
+   

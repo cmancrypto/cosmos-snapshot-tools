@@ -1,9 +1,6 @@
 {
   "chains": [
-    "cosmoshub",
-    "osmosis",
-    "archway"
-  ],
+    "osmosis"],
   "concurrency": 1,
   "retries": 7,
   "validator_retries": 15,
